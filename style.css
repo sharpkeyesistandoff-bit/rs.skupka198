@@ -1,0 +1,621 @@
+/* =========================================================
+   RS:СКУПКА — script.js
+   Форма → Cloudflare Worker → Telegram-бот
+   Токен хранится на сервере Cloudflare, в JS его нет.
+   ========================================================= */
+
+(function () {
+  'use strict';
+
+  const $  = (sel, ctx = document) => ctx.querySelector(sel);
+  const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
+
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* =========================================================
+     ⚙️ АДРЕС CLOUDFLARE WORKER (токен внутри него, не тут)
+     ========================================================= */
+  const WORKER_URL = 'https://rs-telegram.sharpkeyesistandoff.workers.dev';
+
+  /* =========================================================
+     0. МЯГКИЕ ЗВУКИ
+     ========================================================= */
+  let audioCtx = null;
+
+  function ensureAudio() {
+    if (audioCtx) return audioCtx;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      audioCtx = new Ctx();
+      return audioCtx;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function playTone(freq, duration, gainValue) {
+    if (prefersReducedMotion) return;
+    const ctx = ensureAudio();
+    if (!ctx) return;
+    try {
+      if (ctx.state === 'suspended') ctx.resume();
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now);
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(gainValue, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration + 0.05);
+    } catch (e) { /* тихий fallback */ }
+  }
+
+  function playMenuOpenSound() {
+    playTone(560, 0.18, 0.045);
+    setTimeout(() => playTone(780, 0.16, 0.032), 70);
+  }
+
+  function playMenuCloseSound() {
+    playTone(700, 0.16, 0.038);
+    setTimeout(() => playTone(480, 0.18, 0.028), 70);
+  }
+
+  function playEstimateSound() {
+    playTone(660, 0.16, 0.05);
+    setTimeout(() => playTone(880, 0.18, 0.035), 80);
+  }
+
+  /* =========================================================
+     1. HEADER (rAF-throttle, без блокировки скролла)
+     ========================================================= */
+  const header = $('#header');
+
+  let scrollTicking = false;
+  function onScrollRaf() {
+    scrollTicking = false;
+
+    // header
+    if (header) {
+      if (window.scrollY > 12) header.classList.add('is-scrolled');
+      else header.classList.remove('is-scrolled');
+    }
+
+    // to-top
+    if (toTop) {
+      if (window.scrollY > 600) toTop.classList.add('is-visible');
+      else toTop.classList.remove('is-visible');
+    }
+  }
+
+  window.addEventListener('scroll', () => {
+    if (scrollTicking) return;
+    scrollTicking = true;
+    requestAnimationFrame(onScrollRaf);
+  }, { passive: true });
+
+  /* =========================================================
+     2. MOBILE MENU
+     ========================================================= */
+  const burger = $('#burger');
+  const nav = $('#nav');
+  const navClose = $('#nav-close');
+  const navBackdrop = $('#nav-backdrop');
+  const navLinks = $$('.nav__link');
+  const navCta = $('.nav__cta');
+  const navContactsLinks = $$('.nav__contact-row');
+  const body = document.body;
+
+  const isMobile = () => window.innerWidth <= 960;
+
+  function lockBody() { body.classList.add('is-locked'); }
+  function unlockBody() { body.classList.remove('is-locked'); }
+
+  function openMenu() {
+    if (!nav || !burger) return;
+    nav.classList.add('is-open');
+    nav.setAttribute('aria-hidden', 'false');
+    burger.classList.add('is-open');
+    burger.setAttribute('aria-expanded', 'true');
+    burger.setAttribute('aria-label', 'Закрыть меню');
+    if (navBackdrop) {
+      navBackdrop.hidden = false;
+      requestAnimationFrame(() => navBackdrop.classList.add('is-visible'));
+    }
+    playMenuOpenSound();
+    lockBody();
+  }
+
+  function closeMenu() {
+    if (!nav || !burger) return;
+    nav.classList.remove('is-open');
+    nav.setAttribute('aria-hidden', 'true');
+    burger.classList.remove('is-open');
+    burger.setAttribute('aria-expanded', 'false');
+    burger.setAttribute('aria-label', 'Открыть меню');
+    if (navBackdrop) {
+      navBackdrop.classList.remove('is-visible');
+      setTimeout(() => { navBackdrop.hidden = true; }, 320);
+    }
+    playMenuCloseSound();
+    unlockBody();
+  }
+
+  function toggleMenu() {
+    if (!nav) return;
+    if (nav.classList.contains('is-open')) closeMenu();
+    else openMenu();
+  }
+
+  if (burger) {
+    burger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMenu();
+    });
+  }
+
+  if (navClose) {
+    navClose.addEventListener('click', (e) => {
+      e.preventDefault();
+      closeMenu();
+    });
+  }
+
+  if (navBackdrop) navBackdrop.addEventListener('click', closeMenu);
+
+  [...navLinks, navCta, ...navContactsLinks].forEach((link) => {
+    if (!link) return;
+    link.addEventListener('click', () => { if (isMobile()) closeMenu(); });
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && nav && nav.classList.contains('is-open')) closeMenu();
+  });
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!isMobile() && nav && nav.classList.contains('is-open')) closeMenu();
+    }, 120);
+  });
+
+  /* =========================================================
+     3. КНОПКА «ОЦЕНИТЬ УСТРОЙСТВО» — звук
+     ========================================================= */
+  const ctaEstimate = $('#cta-estimate');
+  if (ctaEstimate) ctaEstimate.addEventListener('click', playEstimateSound);
+
+  /* =========================================================
+     4. SMOOTH SCROLL (только для кликов по якорям; native wheel/touch не трогаем)
+     ========================================================= */
+  const anchorLinks = $$('a[href^="#"]');
+
+  anchorLinks.forEach((link) => {
+    link.addEventListener('click', (e) => {
+      const href = link.getAttribute('href');
+      if (!href || href === '#' || href.length < 2) return;
+      const target = document.getElementById(href.slice(1));
+      if (!target) return;
+      e.preventDefault();
+      const headerOffset = header ? header.offsetHeight : 0;
+      const targetTop = target.getBoundingClientRect().top + window.scrollY - headerOffset - 8;
+      if (prefersReducedMotion) window.scrollTo(0, targetTop);
+      else window.scrollTo({ top: targetTop, behavior: 'smooth' });
+      if (history.replaceState) history.replaceState(null, '', href);
+    });
+  });
+
+  /* =========================================================
+     5. REVEAL
+     ========================================================= */
+  const revealEls = $$('.reveal');
+
+  const initReveal = () => {
+    if ('IntersectionObserver' in window && !prefersReducedMotion) {
+      const revealObserver = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+              const el = entry.target;
+              const delay = el.dataset.revealDelay ? parseInt(el.dataset.revealDelay, 10) : 0;
+              if (delay) setTimeout(() => el.classList.add('is-visible'), delay);
+              else el.classList.add('is-visible');
+              revealObserver.unobserve(el);
+            }
+          });
+        },
+        { rootMargin: '0px 0px -8% 0px', threshold: 0.08 }
+      );
+
+      revealEls.forEach((el) => {
+        if (!el.dataset.revealDelay) {
+          const parent = el.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter((c) => c.classList.contains('reveal'));
+            const idx = siblings.indexOf(el);
+            if (idx > 0 && idx < 8) el.dataset.revealDelay = String(idx * 70);
+          }
+        }
+        revealObserver.observe(el);
+      });
+    } else {
+      revealEls.forEach((el) => el.classList.add('is-visible'));
+    }
+  };
+  requestAnimationFrame(initReveal);
+
+  /* =========================================================
+     6. ACTIVE LINK
+     ========================================================= */
+  const sections = $$('main section[id]');
+
+  function setActiveLink(id) {
+    navLinks.forEach((link) => {
+      const href = link.getAttribute('href');
+      if (href === '#' + id) link.classList.add('is-active');
+      else link.classList.remove('is-active');
+    });
+  }
+
+  if ('IntersectionObserver' in window && sections.length) {
+    const spy = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) setActiveLink(entry.target.id);
+        });
+      },
+      { rootMargin: '-45% 0px -50% 0px', threshold: 0 }
+    );
+    sections.forEach((sec) => spy.observe(sec));
+  }
+
+  /* =========================================================
+     7. INLINE COMPARE
+     ========================================================= */
+  const compareToggle = $('#compare-toggle');
+  const comparePanel = $('#compare-panel');
+
+  function setCompareOpen(open) {
+    if (!compareToggle || !comparePanel) return;
+
+    if (open) {
+      compareToggle.setAttribute('aria-expanded', 'true');
+      comparePanel.setAttribute('aria-hidden', 'false');
+      comparePanel.classList.add('is-open');
+      comparePanel.style.maxHeight = '0px';
+      const targetHeight = comparePanel.scrollHeight;
+      requestAnimationFrame(() => {
+        comparePanel.style.maxHeight = targetHeight + 40 + 'px';
+      });
+      const onEnd = () => {
+        comparePanel.style.maxHeight = 'none';
+        comparePanel.removeEventListener('transitionend', onEnd);
+      };
+      comparePanel.addEventListener('transitionend', onEnd);
+    } else {
+      compareToggle.setAttribute('aria-expanded', 'false');
+      comparePanel.setAttribute('aria-hidden', 'true');
+      comparePanel.style.maxHeight = comparePanel.scrollHeight + 'px';
+      void comparePanel.offsetHeight;
+      requestAnimationFrame(() => {
+        comparePanel.style.maxHeight = '0px';
+      });
+      const onEnd = () => {
+        comparePanel.classList.remove('is-open');
+        comparePanel.removeEventListener('transitionend', onEnd);
+      };
+      comparePanel.addEventListener('transitionend', onEnd);
+    }
+  }
+
+  if (compareToggle && comparePanel) {
+    compareToggle.addEventListener('click', (e) => {
+      e.preventDefault();
+      const isOpen = compareToggle.getAttribute('aria-expanded') === 'true';
+      setCompareOpen(!isOpen);
+    });
+  }
+
+  /* =========================================================
+     8. FAQ
+     ========================================================= */
+  const faqItems = $$('.faq__item');
+
+  faqItems.forEach((item) => {
+    const summary = item.querySelector('.faq__summary');
+    const faqBody = item.querySelector('.faq__body');
+    if (!summary || !faqBody) return;
+
+    if (!item.hasAttribute('open')) {
+      faqBody.style.maxHeight = '0px';
+      faqBody.style.opacity = '0';
+      faqBody.style.overflow = 'hidden';
+      faqBody.style.paddingTop = '0px';
+      faqBody.style.paddingBottom = '0px';
+      faqBody.style.transition = 'max-height .35s cubic-bezier(.22,.61,.36,1), opacity .25s ease, padding .35s cubic-bezier(.22,.61,.36,1)';
+    }
+
+    summary.addEventListener('click', (e) => {
+      e.preventDefault();
+      const isOpen = item.hasAttribute('open');
+
+      if (isOpen) {
+        faqBody.style.maxHeight = faqBody.scrollHeight + 'px';
+        faqBody.style.opacity = '1';
+        void faqBody.offsetHeight;
+        requestAnimationFrame(() => {
+          faqBody.style.maxHeight = '0px';
+          faqBody.style.opacity = '0';
+          faqBody.style.paddingTop = '0px';
+          faqBody.style.paddingBottom = '0px';
+        });
+        const onEnd = () => {
+          item.removeAttribute('open');
+          faqBody.removeEventListener('transitionend', onEnd);
+        };
+        faqBody.addEventListener('transitionend', onEnd);
+      } else {
+        item.setAttribute('open', '');
+        faqBody.style.maxHeight = '0px';
+        faqBody.style.opacity = '0';
+        faqBody.style.paddingTop = '0px';
+        faqBody.style.paddingBottom = '0px';
+        void faqBody.offsetHeight;
+        requestAnimationFrame(() => {
+          faqBody.style.maxHeight = (faqBody.scrollHeight + 40) + 'px';
+          faqBody.style.opacity = '1';
+          faqBody.style.paddingTop = '16px';
+          faqBody.style.paddingBottom = '20px';
+        });
+      }
+    });
+  });
+
+  /* =========================================================
+     9. ФОРМА → CLOUDFLARE WORKER → TELEGRAM
+     ========================================================= */
+  const form = $('#lead-form');
+  const formNotice = $('#form-notice');
+
+  // Красивое форматирование телефона
+  const phoneInput = document.querySelector('input[name="phone"]');
+  if (phoneInput) {
+    phoneInput.addEventListener('input', function (e) {
+      let digits = e.target.value.replace(/\D/g, '');
+      if (digits.startsWith('8')) digits = '7' + digits.slice(1);
+      if (digits.startsWith('9')) digits = '7' + digits;
+      if (!digits) { e.target.value = ''; return; }
+      if (!digits.startsWith('7')) digits = '7' + digits;
+      digits = digits.slice(0, 11);
+
+      let formatted = '+7';
+      if (digits.length > 1) formatted += ' ' + digits.slice(1, 4);
+      if (digits.length >= 5) formatted += ' ' + digits.slice(4, 7);
+      if (digits.length >= 8) formatted += '-' + digits.slice(7, 9);
+      if (digits.length >= 10) formatted += '-' + digits.slice(9, 11);
+
+      e.target.value = formatted;
+    });
+  }
+
+  function setFieldError(field, message) {
+    if (!field) return;
+    const wrapper = field.closest('.field') || field.closest('.form__consent');
+    if (!wrapper) return;
+    wrapper.classList.add('is-invalid');
+    const err = wrapper.querySelector('.field__error');
+    if (err) err.textContent = message || '';
+  }
+
+  function clearFieldError(field) {
+    if (!field) return;
+    const wrapper = field.closest('.field') || field.closest('.form__consent');
+    if (!wrapper) return;
+    wrapper.classList.remove('is-invalid');
+    const err = wrapper.querySelector('.field__error');
+    if (err) err.textContent = '';
+  }
+
+  function validateField(field) {
+    if (!field) return true;
+    const type = field.getAttribute('type') || field.tagName.toLowerCase();
+    const value = (field.value || '').trim();
+
+    if (field.type === 'checkbox') {
+      if (!field.checked) { setFieldError(field, 'Отметьте согласие'); return false; }
+      clearFieldError(field);
+      return true;
+    }
+
+    if (!value) { setFieldError(field, 'Заполните поле'); return false; }
+
+    if (type === 'tel') {
+      const digits = value.replace(/\D/g, '');
+      if (digits.length < 10) { setFieldError(field, 'Проверьте номер телефона'); return false; }
+    }
+
+    clearFieldError(field);
+    return true;
+  }
+
+  if (form) {
+    const inputs = form.querySelectorAll('input, select, textarea');
+    inputs.forEach((input) => {
+      input.addEventListener('input', () => {
+        if (input.closest('.is-invalid')) clearFieldError(input);
+      });
+      input.addEventListener('change', () => {
+        if (input.closest('.is-invalid')) clearFieldError(input);
+      });
+    });
+  }
+
+  if (form) {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!formNotice) return;
+
+      const required = form.querySelectorAll('[required]');
+      let allValid = true;
+      let firstInvalid = null;
+
+      required.forEach((field) => {
+        const ok = validateField(field);
+        if (!ok) {
+          allValid = false;
+          if (!firstInvalid) firstInvalid = field;
+        }
+      });
+
+      if (!allValid) {
+        formNotice.textContent = 'Проверьте отмеченные поля.';
+        formNotice.classList.remove('is-success');
+        formNotice.classList.add('is-error');
+        if (firstInvalid && typeof firstInvalid.focus === 'function') firstInvalid.focus();
+        return;
+      }
+
+      const name    = (form.elements.name    && form.elements.name.value    || '').trim();
+      const phone   = (form.elements.phone   && form.elements.phone.value   || '').trim();
+      const intent  = (form.elements.intent  && form.elements.intent.value  || '').trim();
+      const device  = (form.elements.device  && form.elements.device.value  || '').trim();
+      const message = (form.elements.message && form.elements.message.value || '').trim();
+
+      formNotice.textContent = 'Отправляем заявку…';
+      formNotice.classList.remove('is-error');
+      formNotice.classList.add('is-success');
+
+      const submitBtn = form.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+
+      try {
+        const response = await fetch(WORKER_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            name,
+            phone,
+            intent,
+            device,
+            message
+          })
+        });
+
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.ok) {
+          throw new Error(result.description || 'Worker error');
+        }
+
+        formNotice.textContent = '✅ Заявка отправлена!';
+        formNotice.classList.remove('is-error');
+        formNotice.classList.add('is-success');
+        form.reset();
+      } catch (err) {
+        console.error(err);
+        formNotice.textContent = '❌ Не удалось отправить. Позвоните нам: 8-906-278-17-69';
+        formNotice.classList.remove('is-success');
+        formNotice.classList.add('is-error');
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+
+  /* =========================================================
+     10. LIGHTBOX
+     ========================================================= */
+  const lightbox = $('#lightbox');
+  const lightboxImg = $('#lightbox-img');
+  const lightboxClose = $('#lightbox-close');
+  const lightboxBackdrop = $('#lightbox-backdrop');
+
+  function openLightbox(src, alt) {
+    if (!lightbox || !lightboxImg || !src) return;
+    lightboxImg.src = src;
+    lightboxImg.alt = alt || '';
+    lightbox.classList.add('is-open');
+    lightbox.setAttribute('aria-hidden', 'false');
+    lockBody();
+    if (lightboxClose) lightboxClose.focus();
+  }
+
+  function closeLightbox() {
+    if (!lightbox || !lightboxImg) return;
+    lightbox.classList.remove('is-open');
+    lightbox.setAttribute('aria-hidden', 'true');
+    unlockBody();
+    lightboxImg.src = '';
+  }
+
+  if (lightboxClose) lightboxClose.addEventListener('click', closeLightbox);
+  if (lightboxBackdrop) lightboxBackdrop.addEventListener('click', closeLightbox);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && lightbox && lightbox.classList.contains('is-open')) closeLightbox();
+  });
+
+  $$('.photo-frame__media img').forEach((img) => {
+    img.addEventListener('click', () => {
+      const media = img.closest('.photo-frame__media');
+      if (!media || !media.classList.contains('is-loaded')) return;
+      if (!img.src) return;
+      openLightbox(img.src, img.alt);
+    });
+  });
+
+  /* =========================================================
+     11. TO TOP
+     ========================================================= */
+  const toTop = $('#to-top');
+
+  if (toTop) {
+    toTop.addEventListener('click', () => {
+      if (prefersReducedMotion) window.scrollTo(0, 0);
+      else window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  }
+
+  /* =========================================================
+     12. ГОД В FOOTER
+     ========================================================= */
+  const yearEl = $('#year');
+  if (yearEl) yearEl.textContent = String(new Date().getFullYear());
+
+  /* =========================================================
+     13. ФОТО-ЗОНЫ
+     ========================================================= */
+  $$('.photo-frame__media img').forEach((img) => {
+    const media = img.closest('.photo-frame__media');
+    if (!media) return;
+
+    const markLoaded = () => media.classList.add('is-loaded');
+    const markFailed = () => media.classList.add('is-failed');
+
+    if (img.complete && img.naturalWidth > 0) markLoaded();
+    else {
+      img.addEventListener('load', markLoaded);
+      img.addEventListener('error', markFailed);
+    }
+  });
+
+  /* =========================================================
+     14. RESIZE — пересчёт compare-панели
+     ========================================================= */
+  let compareResizeTimer;
+  window.addEventListener('resize', () => {
+    if (!comparePanel) return;
+    if (!comparePanel.classList.contains('is-open')) return;
+    clearTimeout(compareResizeTimer);
+    compareResizeTimer = setTimeout(() => {
+      comparePanel.style.maxHeight = 'none';
+    }, 150);
+  });
+
+})();
